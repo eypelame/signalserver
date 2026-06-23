@@ -1,3 +1,4 @@
+// services/presence_service.go
 package services
 
 import (
@@ -19,7 +20,8 @@ type PresenceService struct {
 	Backend           *backend.Connector
 	clients           sync.Map // map[string]*models.Client (ConnectionID -> Client)
 	userToConnections sync.Map // map[string]*models.UserConnections (Role_UserID -> Connections)
-	userAvailability  sync.Map // map[string]bool (Role_UserID -> isAvailable)
+	userAvailability  map[string]bool
+	availabilityMu    sync.Mutex
 	pushTokens        sync.Map // map[string]string (Role_UserID -> token)
 	userNamesCache    sync.Map // map[string]string (Role_UserID -> name)
 }
@@ -27,8 +29,9 @@ type PresenceService struct {
 // NewPresenceService crea una nueva instancia de PresenceService.
 func NewPresenceService(cfg *config.AppConfig, backend *backend.Connector) *PresenceService {
 	return &PresenceService{
-		Config:  cfg,
-		Backend: backend,
+		Config:           cfg,
+		Backend:          backend,
+		userAvailability: make(map[string]bool),
 	}
 }
 
@@ -47,7 +50,7 @@ func (s *PresenceService) Register(client *models.Client) (int, []*models.Client
 	totalConns := len(uc.Connections)
 	uc.Mu.Unlock()
 
-	s.userAvailability.Store(clientKey, true) // Por defecto disponible al conectar (sujeto a lógica de llamada)
+	s.SetUserAvailability(client.UserID, client.UserRole, true)
 	s.userNamesCache.Store(clientKey, client.UserName)
 
 	metrics.ActiveConnections.WithLabelValues(client.UserRole).Inc()
@@ -97,7 +100,7 @@ func (s *PresenceService) Unregister(client *models.Client) (bool, bool) {
 				if client.UserRole == "escucha" && hasPushToken {
 					// No desactivamos disponibilidad, permitimos que sea contactado vía Push
 				} else {
-					s.userAvailability.Store(clientKey, false)
+					s.SetUserAvailability(client.UserID, client.UserRole, false)
 					metrics.AvailableUsers.WithLabelValues(client.UserRole).Dec()
 				}
 			}
@@ -111,31 +114,17 @@ func (s *PresenceService) Unregister(client *models.Client) (bool, bool) {
 
 // UpdateAvailability actualiza la disponibilidad manual de un usuario.
 func (s *PresenceService) UpdateAvailability(client *models.Client, isAvailable bool) {
-	clientKey := fmt.Sprintf("%s_%s", client.UserRole, client.UserID)
-
-	currentAvailable := false
-	if v, ok := s.userAvailability.Load(clientKey); ok {
-		currentAvailable = v.(bool)
-	}
-
-	if currentAvailable != isAvailable {
-		if isAvailable {
-			metrics.AvailableUsers.WithLabelValues(client.UserRole).Inc()
-		} else {
-			metrics.AvailableUsers.WithLabelValues(client.UserRole).Dec()
-		}
-	}
-	s.userAvailability.Store(clientKey, isAvailable)
+	s.SetUserAvailability(client.UserID, client.UserRole, isAvailable)
 }
 
-// SetUserAvailability fuerza el estado de disponibilidad (ej. por llamada activa).
+// SetUserAvailability fuerza el estado de disponibilidad de forma atómica.
 func (s *PresenceService) SetUserAvailability(userID, role string, isAvailable bool) {
 	clientKey := fmt.Sprintf("%s_%s", role, userID)
 
-	current := false
-	if v, ok := s.userAvailability.Load(clientKey); ok {
-		current = v.(bool)
-	}
+	s.availabilityMu.Lock()
+	defer s.availabilityMu.Unlock()
+
+	current := s.userAvailability[clientKey]
 
 	if current != isAvailable {
 		if isAvailable {
@@ -144,16 +133,17 @@ func (s *PresenceService) SetUserAvailability(userID, role string, isAvailable b
 			metrics.AvailableUsers.WithLabelValues(role).Dec()
 		}
 	}
-	s.userAvailability.Store(clientKey, isAvailable)
+	s.userAvailability[clientKey] = isAvailable
 }
 
 // IsUserAvailable verifica si un usuario está marcado como disponible.
 func (s *PresenceService) IsUserAvailable(userID, role string) bool {
 	clientKey := fmt.Sprintf("%s_%s", role, userID)
-	if v, ok := s.userAvailability.Load(clientKey); ok {
-		return v.(bool)
-	}
-	return false
+
+	s.availabilityMu.Lock()
+	defer s.availabilityMu.Unlock()
+
+	return s.userAvailability[clientKey]
 }
 
 // UpdatePushToken actualiza el token de notificaciones push.
@@ -202,17 +192,38 @@ func (s *PresenceService) GetClientByID(connID string) (*models.Client, bool) {
 }
 
 // BuildClientsList genera la lista de clientes disponibles para enviar a las apps.
+// Usa un snapshot de disponibilidad para garantizar consistencia durante la iteración.
 func (s *PresenceService) BuildClientsList() models.ClientsListPayload {
+	// 1. Congelar el estado de disponibilidad primero
+	s.availabilityMu.Lock()
+	availSnapshot := make(map[string]bool, len(s.userAvailability))
+	for k, v := range s.userAvailability {
+		availSnapshot[k] = v
+	}
+	s.availabilityMu.Unlock()
+
+	// 2. Snapshot de push tokens (menos crítico pero mantiene consistencia)
+	pushSnapshot := make(map[string]string)
+	s.pushTokens.Range(func(key, value interface{}) bool {
+		pushSnapshot[key.(string)] = value.(string)
+		return true
+	})
+
+	// 3. Snapshot de nombres cacheados
+	namesSnapshot := make(map[string]string)
+	s.userNamesCache.Range(func(key, value interface{}) bool {
+		namesSnapshot[key.(string)] = value.(string)
+		return true
+	})
+
+	// 4. Construir la lista con los snapshots
 	uniqueClients := make(map[string]models.ClientInfo)
 
 	s.clients.Range(func(key, value interface{}) bool {
 		client := value.(*models.Client)
 		clientKey := fmt.Sprintf("%s_%s", client.UserRole, client.UserID)
 		if _, exists := uniqueClients[clientKey]; !exists {
-			available := false
-			if v, ok := s.userAvailability.Load(clientKey); ok {
-				available = v.(bool)
-			}
+			available := availSnapshot[clientKey] // usa snapshot, no sync.Map
 			uniqueClients[clientKey] = models.ClientInfo{
 				UserID:       client.UserID,
 				UserName:     client.UserName,
@@ -225,9 +236,8 @@ func (s *PresenceService) BuildClientsList() models.ClientsListPayload {
 		return true
 	})
 
-	s.pushTokens.Range(func(key, value interface{}) bool {
-		clientKey := key.(string)
-		token := value.(string)
+	// 5. Agregar usuarios que solo tienen push token (sin conexión activa)
+	for clientKey, token := range pushSnapshot {
 		if token != "" {
 			if _, exists := uniqueClients[clientKey]; !exists {
 				parts := strings.SplitN(clientKey, "_", 2)
@@ -239,14 +249,11 @@ func (s *PresenceService) BuildClientsList() models.ClientsListPayload {
 				}
 
 				userName := "Usuario (Push)"
-				if cachedName, ok := s.userNamesCache.Load(clientKey); ok && cachedName != "" {
-					userName = cachedName.(string)
+				if cachedName, ok := namesSnapshot[clientKey]; ok && cachedName != "" {
+					userName = cachedName
 				}
 
-				available := false
-				if v, ok := s.userAvailability.Load(clientKey); ok {
-					available = v.(bool)
-				}
+				available := availSnapshot[clientKey] // usa snapshot
 
 				uniqueClients[clientKey] = models.ClientInfo{
 					UserID:      userID,
@@ -257,9 +264,9 @@ func (s *PresenceService) BuildClientsList() models.ClientsListPayload {
 				}
 			}
 		}
-		return true
-	})
+	}
 
+	// 6. Separar disponibles de no disponibles
 	var availableListeners []models.ClientInfo
 	var otherClients []models.ClientInfo
 
@@ -273,6 +280,7 @@ func (s *PresenceService) BuildClientsList() models.ClientsListPayload {
 
 	totalAvailable := len(availableListeners)
 
+	// 7. Aleatorizar y limitar
 	rand.Seed(time.Now().UnixNano())
 	rand.Shuffle(len(availableListeners), func(i, j int) {
 		availableListeners[i], availableListeners[j] = availableListeners[j], availableListeners[i]

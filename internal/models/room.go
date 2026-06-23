@@ -1,3 +1,4 @@
+// models/room.go
 package models
 
 import (
@@ -20,22 +21,29 @@ type Room struct {
 	CallStatus            string               // Estado actual de la llamada (e.g., "pending", "active", "completed", "rejected")
 	ReasonForEnd          string               // Razón por la que terminó la llamada
 	BillingProcessed      bool                 // Flag para asegurar que la llamada solo se facture una vez
+	billingFinalized      bool                 // Flag atómico para evitar doble facturación
 	CallRequestCancelFunc context.CancelFunc   // Función para cancelar el temporizador de solicitud de llamada
 	SignalingBuffer       map[string][]Message // Mensajes de señalización retenidos por UserID
 	ConnType              int                  // Tipo de conexión (1: Host, 2: Srflx, 3: Relay)
+	TimerCtx              context.Context      // Contexto para cancelar el timer de duración máxima
+	TimerCancel           context.CancelFunc   // Función para cancelar el timer de duración máxima
 	mu                    sync.RWMutex         // Mutex para proteger el acceso concurrente a los campos de la sala
 }
 
 // NewRoom crea una nueva instancia de Room.
 func NewRoom(id, callerUserID, callerRole string, callMaxDuration time.Duration) *Room {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Room{
-		ID:              id,
-		Clients:         make(map[string]*Client),
-		CallerUserID:    callerUserID,
-		CallerRole:      callerRole,
-		CallMaxDuration: callMaxDuration,
-		CallStatus:      "pending", // Estado inicial de la llamada
-		SignalingBuffer: make(map[string][]Message),
+		ID:               id,
+		Clients:          make(map[string]*Client),
+		CallerUserID:     callerUserID,
+		CallerRole:       callerRole,
+		CallMaxDuration:  callMaxDuration,
+		CallStatus:       "pending", // Estado inicial de la llamada
+		SignalingBuffer:  make(map[string][]Message),
+		TimerCtx:         ctx,
+		TimerCancel:      cancel,
+		billingFinalized: false,
 	}
 }
 
@@ -109,16 +117,20 @@ func (r *Room) Reject(reason string) {
 	r.ReasonForEnd = reason
 }
 
-// Complete marca la sala como finalizada de manera normal (colgo un participante).
+// Complete marca la sala como finalizada de manera normal (colgó un participante).
+// Es idempotente: solo completa si está en estado "active".
 func (r *Room) Complete(reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.CallStatus != "active" {
+		return // Ya fue completada o rechazada, no hacer nada
+	}
 	r.CallStatus = "completed"
 	r.CallEndTime = time.Now()
 	r.ReasonForEnd = reason
 }
 
-// Timeout marca la sala por limite de tiempo o falta de respuesta.
+// Timeout marca la sala por límite de tiempo o falta de respuesta.
 func (r *Room) Timeout(reason string, isPending bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -165,4 +177,16 @@ func (r *Room) FlushBuffer(userID string) []Message {
 	msgs := r.SignalingBuffer[userID]
 	delete(r.SignalingBuffer, userID)
 	return msgs
+}
+
+// MarkBillingFinalized marca la sala como facturada de forma atómica.
+// Retorna true si es la primera vez que se factura, false si ya fue facturada.
+func (r *Room) MarkBillingFinalized() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.billingFinalized {
+		return false
+	}
+	r.billingFinalized = true
+	return true
 }

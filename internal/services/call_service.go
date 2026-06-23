@@ -1,11 +1,14 @@
+// services/call_service.go
 package services
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"signalserver/internal/backend"
 	"signalserver/internal/config"
+	"signalserver/internal/logger"
 	"signalserver/internal/metrics"
 	"signalserver/internal/models"
 
@@ -19,11 +22,11 @@ type CallService struct {
 	PushService     *PushService
 	Backend         *backend.Connector
 	RoomManager     *models.RoomManager
+	initiateMu      sync.Mutex // Garantiza atomicidad en InitiateCall
 }
 
 // NewCallService crea una nueva instancia de CallService.
 func NewCallService(cfg *config.AppConfig, presence *PresenceService, push *PushService, backend *backend.Connector, roomManager *models.RoomManager) *CallService {
-
 	return &CallService{
 		Config:          cfg,
 		PresenceService: presence,
@@ -33,12 +36,16 @@ func NewCallService(cfg *config.AppConfig, presence *PresenceService, push *Push
 	}
 }
 
-// InitiateCall inicia el proceso de una llamada.
+// InitiateCall inicia el proceso de una llamada de forma atómica.
+// Solo un caller puede iniciar una llamada a la vez contra el mismo target.
 func (s *CallService) InitiateCall(caller *models.Client, targetID string) (string, error) {
+	s.initiateMu.Lock()
+	defer s.initiateMu.Unlock()
+
 	metrics.CallRequestsTotal.Inc()
 	targetRole := "escucha"
 
-	// 1. Verificar disponibilidad del objetivo
+	// 1. Verificar disponibilidad del objetivo (atómico con el resto de la operación)
 	if !s.PresenceService.IsUserAvailable(targetID, targetRole) {
 		return "", fmt.Errorf("el usuario no está disponible")
 	}
@@ -166,17 +173,33 @@ func (s *CallService) Hangup(actorID, actorRole, roomID, eventType string) (*mod
 }
 
 // FinalizeBilling procesa la facturación al finalizar una llamada activa.
+// Usa MarkBillingFinalized para garantizar facturación única.
 func (s *CallService) FinalizeBilling(room *models.Room, reason string) {
-	if room.CallStartTime.IsZero() {
+	if !room.MarkBillingFinalized() {
+		logger.Log.Warnf("[BILLING] Facturación ya realizada para sala %s, ignorando duplicado.", room.ID)
 		return
 	}
+
+	if room.CallStartTime.IsZero() {
+		logger.Log.Warnf("[BILLING] CallStartTime es zero para sala %s, no se puede facturar.", room.ID)
+		return
+	}
+
 	endTime := time.Now()
 	duration := int(endTime.Sub(room.CallStartTime).Seconds())
+
+	metrics.CallDurationHistogram.Observe(float64(duration))
+
 	go s.Backend.ProcessCall(room.ID, room.CallerUserID, room.ListenerUserID, room.CallStartTime, endTime, duration, reason, room.ConnType)
 }
 
 // finalizeCallState limpia los estados de disponibilidad y notifica al backend tras finalizar.
 func (s *CallService) finalizeCallState(room *models.Room) {
+	// Cancelar el timer de duración máxima si existe
+	if room.TimerCancel != nil {
+		room.TimerCancel()
+	}
+
 	go s.Backend.UpdateCallStatus(room.CallerUserID, 1, room.CallerRole)
 	go s.Backend.UpdateCallStatus(room.ListenerUserID, 1, room.ListenerRole)
 

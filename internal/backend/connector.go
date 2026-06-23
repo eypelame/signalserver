@@ -1,3 +1,4 @@
+// backend/connector.go
 package backend
 
 import (
@@ -15,10 +16,17 @@ import (
 	"signalserver/internal/metrics"
 )
 
+const (
+	// maxConcurrentHTTPRequests limita las goroutines HTTP simultáneas al backend PHP.
+	// 50 requests concurrentes es suficiente para miles de usuarios.
+	maxConcurrentHTTPRequests = 50
+)
+
 // Connector handles server-to-server communication with the main PHP API.
 type Connector struct {
-	Config *config.AppConfig
-	Client *http.Client
+	Config     *config.AppConfig
+	Client     *http.Client
+	workerPool chan struct{} // Semáforo para limitar concurrencia HTTP
 }
 
 func NewConnector(cfg *config.AppConfig) *Connector {
@@ -27,6 +35,7 @@ func NewConnector(cfg *config.AppConfig) *Connector {
 		Client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		workerPool: make(chan struct{}, maxConcurrentHTTPRequests),
 	}
 }
 
@@ -37,11 +46,17 @@ func (c *Connector) hashMessage(body []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// acquireSlot bloquea hasta que haya un slot disponible en el worker pool.
+// Retorna una función que debe llamarse para liberar el slot.
+func (c *Connector) acquireSlot() func() {
+	c.workerPool <- struct{}{}
+	return func() { <-c.workerPool }
+}
+
 // UpdateCallStatus sends a status update to the PHP API.
 // Status: 1 = Available, 2 = Busy
 func (c *Connector) UpdateCallStatus(userID string, status int, userType string) {
 	if c.Config.ApiWebhookUrl == "" {
-		// Feature disabled if no URL configured
 		return
 	}
 
@@ -70,8 +85,11 @@ func (c *Connector) UpdateCallStatus(userID string, status int, userType string)
 		req.Header.Set("X-Hub-Signature-256", c.hashMessage(jsonPayload))
 	}
 
-	// Run asynchronously to avoid blocking the signaling loop
+	// Run asynchronously with worker pool
 	go func() {
+		release := c.acquireSlot()
+		defer release()
+
 		start := time.Now()
 		resp, err := c.Client.Do(req)
 		duration := time.Since(start).Seconds()
@@ -126,6 +144,9 @@ func (c *Connector) ProcessCall(roomID, callerID, listenerID string, startTime, 
 	}
 
 	go func() {
+		release := c.acquireSlot()
+		defer release()
+
 		start := time.Now()
 		resp, err := c.Client.Do(req)
 		duration := time.Since(start).Seconds()

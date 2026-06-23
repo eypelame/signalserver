@@ -1,3 +1,4 @@
+// handlers/call_handlers.go
 package handlers
 
 import (
@@ -257,16 +258,19 @@ func (h *WebSocketHandler) handleSignalingMessage(client *models.Client, msg mod
 }
 
 func (h *WebSocketHandler) startCallTimer(room *models.Room) {
-	roomID := room.ID
-	timeout := room.CallMaxDuration
-	timer := time.NewTimer(timeout)
+	timer := time.NewTimer(room.CallMaxDuration)
 	defer timer.Stop()
 
-	<-timer.C
-	if _, err := h.CallService.Hangup(room.CallerUserID, room.CallerRole, roomID, "timeout"); err == nil {
-		// Notificar timeout
-		h.notifyCallTimeout(room)
-		h.broadcastClientList()
+	select {
+	case <-timer.C:
+		if _, err := h.CallService.Hangup(room.CallerUserID, room.CallerRole, room.ID, "timeout"); err == nil {
+			h.notifyCallTimeout(room)
+			h.broadcastClientList()
+		}
+	case <-room.TimerCtx.Done():
+		// Llamada finalizada normalmente, salir limpiamente
+		logger.Log.Debugf("[TIMER] Timer cancelado para sala %s.", room.ID)
+		return
 	}
 }
 
@@ -294,6 +298,7 @@ func (h *WebSocketHandler) startCallRequestTimer(room *models.Room, callerClient
 
 	timeout := time.Duration(h.Config.CallRequestTimeoutSeconds) * time.Second
 	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
 	select {
 	case <-timer.C:
@@ -305,6 +310,8 @@ func (h *WebSocketHandler) startCallRequestTimer(room *models.Room, callerClient
 			h.broadcastClientList()
 		}
 	case <-ctx.Done():
+		// Solicitud de llamada respondida antes del timeout
+		return
 	}
 }
 
